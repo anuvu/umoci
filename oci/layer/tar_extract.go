@@ -142,6 +142,25 @@ func (te *TarExtractor) applyMetadata(path string, hdr *tar.Header) error {
 	return te.restoreMetadata(path, hdr)
 }
 
+func (te *TarExtractor) isDirlink(root string, path string, hdr *tar.Header) (bool, error) {
+	link, err := te.fsEval.Readlink(path)
+	if err != nil {
+		return false, nil
+	}
+
+	linkPath, err := securejoin.SecureJoinVFS(root, link, te.fsEval)
+	if err != nil {
+		return false, errors.Wrap(err, "sanitize old target")
+	}
+
+	linkInfo, err := te.fsEval.Lstat(linkPath)
+	if err != nil {
+		return false, nil
+	}
+
+	return linkInfo.IsDir(), nil
+}
+
 // unpackEntry extracts the given tar.Header to the provided root, ensuring
 // that the layer state is consistent with the layer state that produced the
 // tar archive being iterated over. This does handle whiteouts, so a tar.Header
@@ -253,17 +272,6 @@ func (te *TarExtractor) UnpackEntry(root string, hdr *tar.Header, r io.Reader) (
 		fi = hdr.FileInfo()
 	}
 
-	// If the type of the file has changed, there's nothing we can do other
-	// than just remove the old path and replace it.
-	// XXX: Is this actually valid according to the spec? Do you need to have a
-	//      whiteout in this case, or can we just assume that a change in the
-	//      type is reason enough to purge the old type.
-	if hdrFi.Mode()&os.ModeType != fi.Mode()&os.ModeType {
-		if err := te.fsEval.RemoveAll(path); err != nil {
-			return errors.Wrap(err, "replace removeall")
-		}
-	}
-
 	// Attempt to create the parent directory of the path we're unpacking.
 	// We do a MkdirAll here because even though you need to have a tar entry
 	// for every component of a new path, applyMetadata will correct any
@@ -277,28 +285,22 @@ func (te *TarExtractor) UnpackEntry(root string, hdr *tar.Header, r io.Reader) (
 
 	isDirlink := false
 	if fi.Mode()&os.ModeSymlink != 0 && hdr.Typeflag == tar.TypeDir &&
-			te.mapOptions.KeepDirlinks {
-		link, err := te.fsEval.Readlink(path)
+		te.mapOptions.KeepDirlinks {
+		isDirlink, err = te.isDirlink(root, path, hdr)
 		if err != nil {
-			return errors.Wrapf(err, "read old path link: %s", path)
+			return err
 		}
-
-		linkPath, err := securejoin.SecureJoinVFS(root, link, te.fsEval)
-		if err != nil {
-			return errors.Wrap(err, "sanitize old target")
+	} else if hdrFi.Mode()&os.ModeType != fi.Mode()&os.ModeType {
+		// If the type of the file has changed, there's nothing we can do other
+		// than just remove the old path and replace it.
+		// XXX: Is this actually valid according to the spec? Do you need to have a
+		//      whiteout in this case, or can we just assume that a change in the
+		//      type is reason enough to purge the old type.
+		if err := te.fsEval.RemoveAll(path); err != nil {
+			return errors.Wrap(err, "replace removeall")
 		}
-
-		linkInfo, err := te.fsEval.Lstat(linkPath)
-		if err != nil {
-			return errors.Wrap(err, "stat old target link")
-		}
-
-		if !linkInfo.IsDir() {
-			return errors.Errorf("%s is not a directory, but is the target of a dir link %s", linkInfo.Name(), path)
-		}
-
-		isDirlink = true
 	}
+
 
 	// Now create or otherwise modify the state of the path. Right now, either
 	// the type of path matches hdr or the path doesn't exist. Note that we
